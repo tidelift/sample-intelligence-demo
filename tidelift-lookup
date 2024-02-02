@@ -1,0 +1,162 @@
+#!/usr/bin/python
+#
+# SPDX-FileCopyrightText: 2024 Tidelift, Inc.
+#
+# SPDX-License-Identifier: BlueOak-1.0.0
+#
+# Read a series of syft outputs, and return a CSV that
+# assesses them against Tidelift's API to determine
+# what bad dependencies are in use that the organization
+# should move away from.
+
+import csv
+import json
+import os
+import sys
+
+from functools import cmp_to_key
+
+import urllib3
+
+# the Tidelift bulk API has a limit of 1000 entries. Pick something below that
+BATCH_SIZE = 900
+
+# Pull API key from environment
+key = os.getenv("TIDELIFT_API_KEY")
+
+if len(sys.argv) < 2:
+    print("Usage: tidelift-lookup <sbom> <sbom2> <sbom3>..")
+    sys.exit(1)
+
+
+# Compare two software versions
+#
+# We don't use a specific python semver library because we want to
+# do our best with versions that aren't technically semver.
+def vercmp(a, b, major_only=False):
+    a_parts = a.split(".")
+    b_parts = b.split(".")
+    index = 0
+    while index < len(a_parts):
+        try:
+            return int(a_parts[index]) - int(b_parts[index])
+        except:
+            pass
+        if major_only:
+            return 0
+        index += 1
+    return 0
+
+
+def rowcmp(a, b):
+    return vercmp(a[0], b[0])
+
+
+sboms = {}
+for filename in sys.argv[1:]:
+    with open(filename, "r") as sbomfile:
+        data = sbomfile.readlines()
+        app_version = filename.replace(".syft", "")
+        sboms[app_version] = []
+        for line in data:
+            try:
+                (name, version, platform) = line.split()
+            except:  # GitHub actions, other non-platform things may not have all fields
+                continue
+            if platform in ("github-action", "TYPE"):
+                continue
+            if (
+                platform == "python"
+            ):  # TODO: see if more mappings for syft platforms are needed
+                platform = "pypi"
+            if (platform, name, version) not in sboms[app_version]:
+                sboms[app_version].append((platform, name, version))
+
+pool = urllib3.PoolManager()
+headers = urllib3.HTTPHeaderDict()
+headers.add("Accept", "application/json")
+headers.add("Authorization", f"bearer {key}")
+
+output = []
+for sbom_version in sboms.keys():
+    index = 0
+    pkgs = sboms[sbom_version]
+    good_packages = []
+    unassessed_packages = []
+    bad_packages = []
+    more_than_one_major_behind_packages = []
+    while True:
+        subset = pkgs[index : index + BATCH_SIZE]
+
+        rawdata = {
+            "packages": list(map(lambda x: {"platform": x[0], "name": x[1]}, subset))
+        }
+
+        # Use Tidelift's bulk package API (much faster than individual requests)
+        resp = pool.request(
+            "POST",
+            "https://api.tidelift.com/external-api/v1/packages/lookup",
+            headers=headers,
+            json=rawdata,
+        )
+
+        if resp.status != 200:
+            print(f"Error retrieving data from API: {resp.status}")
+            sys.exit(1)
+
+        for pkg in resp.json()["packages"]:
+            key = f"{pkg['platform']}/{pkg['name']}"
+            # Check the recommendation status
+            if pkg["tidelift_recommendation"] == "recommended":
+                good_packages.append(key)
+            else:
+                bad_packages.append(key)
+            # See if we're more than one major behind the latest recommended release
+            if pkg["latest_recommended_release"]["version"]:
+                for sbom_entry in pkgs:
+                    if (
+                        sbom_entry[0] == pkg["platform"]
+                        and sbom_entry[1] == pkg["name"]
+                    ):
+                        sbom_ver = sbom_entry[2]
+                        rec_ver = pkg["latest_recommended_release"]["version"]
+                        if vercmp(rec_ver, sbom_ver, major_only=True) >= 1:
+                            more_than_one_major_behind_packages.append(key)
+
+        for pkg in resp.json()["missing_results"]:
+            key = f"{pkg['platform']}/{pkg['name']}"
+            unassessed_packages.append(key)
+
+        index += BATCH_SIZE
+        if index > len(pkgs):
+            break
+    output.append(
+        (
+            sbom_version,
+            len(good_packages),
+            bad_packages,
+            len(bad_packages),
+            unassessed_packages,
+            len(unassessed_packages),
+            more_than_one_major_behind_packages,
+            len(more_than_one_major_behind_packages),
+        )
+    )
+
+output.sort(key=cmp_to_key(rowcmp))
+
+with sys.stdout as csvfile:
+    fieldnames = (
+        "version",  # application version
+        "good_count",  # number of 'good' dependencies
+        "bad",  # list of 'bad' dependencies
+        "bad_count",  # count of 'bad' dependencies
+        "unassesed",  # list of unassessed-by-Tidelift dependencies (internal pkgs, etc)
+        "unassessed_count",  # count of unassessed-by-Tidelift dependencies
+        "behind",  # list of dependences not on the latest major release stream
+        "behind_count",  # count of dependencies not on the latest major release stream
+    )
+    writer = csv.writer(csvfile)
+    writer.writerow(fieldnames)
+    for entry in output:
+        writer.writerow(entry)
